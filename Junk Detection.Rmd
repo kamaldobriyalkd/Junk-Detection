@@ -1,0 +1,277 @@
+---
+title: "Junk Detection"
+author: "Kamal Dobriyal"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+load(".Rdata")
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message=FALSE, eval=FALSE)
+```
+## Project Overview
+In daily life we receive mails and messages from different people and those people
+can send you mails/messages by ordinary purpose but some of them can send you junk
+mail/messages which is not necessary for you at all.
+
+This project is also about classification of mail/messages as ham (not junk) and spam (junk). For this we taken use of few libraries and **Singular Value Decomposition** method has been also used with **Term Frequency - Inverse Document Frequency** applied on data. Text length and <br/>
+**N-grams** also affected the classification, We have used **Random Forest** machine learning model for classification.
+
+```{r warning=FALSE, message=FALSE, eval=TRUE}
+#loading required libraries
+library(ggplot2)
+library(caret)
+library(quanteda)
+library(lexicon)
+library(doSNOW)
+library(irlba)
+library(lsa)
+```
+
+Data set used in this project can be found [here](https://www.kaggle.com/advikmaniar/spam-ham-dataset/download)
+```{r}
+#reading the data
+data<-read.csv("SMSSpamCollection1.csv")
+data<-data[,1:2]
+data[,2]<-iconv(data[,2])
+
+names(data)<-c("type","text")
+
+data$type<-as.factor(data$type)
+
+```
+
+We will check whether **text length** is playing a vital role in classification by plotting a graph of text length.
+```{r eval=TRUE}
+ggplot(data,aes(nchar(text),fill=type))+geom_histogram(binwidth = 5)
+```
+
+From the above graph we can clearly see that longer text tends to be spam and shorter text tends to be ham. So we will also include the text length in the data set to increase accuracy.
+
+### Partitioning data
+```{r}
+#creating train 70% and test 30% data sets 
+intrain<-createDataPartition(data$type,p=0.7,list = F)
+trainSet<-data[intrain,]
+testSet<-data[-intrain,]
+```
+
+We can check if we get the balanced data sets or not
+```{r eval=TRUE, comment=""}
+dataHam=sum(data$type=="ham")/length(data$type)
+dataSpam=sum(data$type=="spam")/length(data$type)
+
+trainSetHam=sum(trainSet$type=="ham")/length(trainSet$type)
+trainSetSpam=sum(trainSet$type=="spam")/length(trainSet$type)
+
+testSetHam=sum(testSet$type=="ham")/length(testSet$type)
+testSetSpam=sum(testSet$type=="spam")/length(testSet$type)
+
+proptable=data.frame(Ham=c(dataHam,trainSetHam,testSetHam),Spam=c(dataSpam,trainSetSpam,testSetSpam))
+rownames(proptable)=c("Data","TrainSet","TestSet")
+proptable
+
+```
+From above dataframe it is very clear that the data is correctly stratified in both train and test data set.
+
+### Token creation and Data wrangling (Train Data Set)
+Now we will create tokens out of train data set and data cleaning will follow the procedure. Then bi-grams will be added (for more specificity tri-grams and quad-grams can also be included but biasness should also be considered). After that we have created TF-IDF matrix.
+```{r}
+#lower case the tokens
+trainTokens<-quanteda::tokens_tolower(trainTokens)
+
+#removing stop words
+trainTokens<-quanteda::tokens_select(trainTokens,stopwords(),selection = "remove")
+
+#lemmatisation of tokens
+trainTokens<-tokens_replace(trainTokens,pattern = hash_lemmas$token, replacement = hash_lemmas$lemma)
+
+#adding bigrams to create feature matrix
+trainTokens<-tokens_ngrams(trainTokens,n=1:2)
+
+
+#creating document frequency DF and matrix
+trainTokensDfm<-dfm(trainTokens,tolower = F)
+trainTokensMat<-as.matrix(trainTokensDfm)
+
+#function for calculating relative term frequency (TF)
+tf <- function(row) {
+  row / sum(row)
+}
+
+#function for calculating inverse document frequency (IDF)
+idf <- function(col) {
+  corpusSize <- length(col)
+  docCount <- length(which(col > 0))
+
+  log10(corpusSize / docCount)
+}
+
+#function for calculating TF-IDF.
+tf_idf <- function(tf, idf) {
+  tf * idf
+}
+
+#normalize all documents via TF.
+trainTokensTf <- apply(trainTokensMat, 1, tf)
+
+#calculate the IDF vector that we will use - both
+#for training data and for test data!
+trainTokensIdf <- apply(trainTokensMat, 2, idf)
+
+#calculate TF-IDF for our training corpus.
+trainTokensTfIdf <-  apply(trainTokensTf, 2, tf_idf, idf = trainTokensIdf)
+
+#transposing the matrix
+trainTokensTfIdf <- t(trainTokensTfIdf)
+
+#imputing incomplete cases with "0"
+ic<- which(!complete.cases(trainTokensTfIdf))
+trainTokensTfIdf[ic,]<-0
+```
+
+```{r eval=TRUE, comment=""}
+dim(trainTokensTfIdf)
+```
+We can see TF-IDF will forge a big blast in the dimensions of our train data set.
+
+### LSA leveraging SVD
+Now we are having TF-IDF matrix now we will Latent Semantic Analysis to leverage Singular Value Decomposition and this is the balck box procedure. This will affect all the three - Accuracy, Sensitivity & Specificity.
+
+```{r}
+trainLsa<-irlba(t(trainTokensTfIdf),nv=300, maxit=600)
+
+#creating new feature data frame using the document semantic space
+trainSvd<-cbind(hamOrspam=trainSet$type,as.data.frame(trainLsa$v))
+
+#to increase accuracy, sensitivity and specificity we will include text length as predictor
+trainSvd<-cbind(trainSvd,textLength=nchar(trainSet$text))
+```
+
+```{r eval=TRUE, comment=""}
+dim(trainSvd)
+```
+After LSA and SVD there we have confined the dimensions of our train data set.
+
+### Model Creation
+We are using random forest method to train model. For this we have used Multi-Fold cross validation and we have tuned the length at 7 so that random forest will use 7 different configuration for each tree. 
+In this case number of trees will be formed are: 10 * 3 * 7 * 500 = 1,05,000 trees, as 10 different CV, 3 times, 7 configurations, and by default 500 trees per CV. So this process is gonna take much time so I have utilized 5 cores of my system to make this procedure faster than usual.
+```{r}
+#creating cross validation for training model
+cValid<-createMultiFolds(trainSvd$hamOrspam,k=10,times = 3)
+control<-trainControl(method="repeatedcv",number = 10,repeats = 3, index = cValid)
+
+#creating socket cluster to enhance speed
+cl<-makeCluster(5,type = "SOCK")
+registerDoSNOW(cl)
+
+#creating classification model
+mod<-train(hamOrspam~.,data=trainSvd,method="rf",trControl=control, tuneLength=7)
+stopCluster(cl)
+```
+This is the model created with the above configuration.
+```{r echo=FALSE, eval=TRUE}
+mod
+```
+
+### Applying model on train data set
+```{r eval=TRUE}
+pred<-predict(mod,trainSvd)
+confusionMatrix(pred,trainSvd$hamOrspam)
+```
+We can see that we are getting **100% accuracy** with good specificity and sensitivity but to verify this we have to apply this model on  test data set as well to check if this is the case of overfitting or not.
+
+```{r echo=FALSE}
+#creating cross validation for training model
+cValid<-createMultiFolds(trainSvd$hamOrspam,k=10,times = 3)
+control<-trainControl(method="repeatedcv",number = 10,repeats = 3, index = cValid)
+
+thatTime<-Sys.time()
+
+#creating socket cluster to enhance speed
+cl<-makeCluster(5,type = "SOCK")
+registerDoSNOW(cl)
+
+#creating classification model
+mod<-train(hamOrspam~.,data=trainSvd,method="rf",trControl=control, tuneLength=7)
+stopCluster(cl)
+
+timeTaken<-Sys.time()-thatTime
+saveRDS(mod,"mod.rds")trainTOken
+```
+
+### Token creation and Data wrangling (Test Data Set)
+Now its time to apply the same techniques for data processing on test data set which we applied on train data set so that both will be having same number of attributes.
+```{r}
+testTokens<-quanteda::tokens(testSet$text,what="word",
+                    remove_punct = T, remove_symbols = T,
+                    remove_numbers = T)
+
+#lower case the tokens
+testTokens<-quanteda::tokens_tolower(testTokens)
+
+#removing stop words
+testTokens<-quanteda::tokens_select(testTokens,stopwords(),selection = "remove")
+
+#lemmatisation of tokens
+testTokens<-tokens_replace(testTokens,pattern = hash_lemmas$token, replacement = hash_lemmas$lemma)
+
+#adding bigrams to create feature matrix
+testTokens<-tokens_ngrams(testTokens,n=1:2)
+
+#creating document frequency matrix
+testTokensDfm<-dfm(testTokens,tolower = F)
+```
+
+```{r}
+sigmaInverse<-1/trainLsa$d
+uTranspose<-t(trainLsa$u)
+document<-trainTokensTfIdf[1,]
+documentHat<-sigmaInverse*uTranspose%*%document
+
+```
+
+```{r}
+#projecting features in testSet
+testTokensDfm<-dfm_match(testTokensDfm,features = featnames(trainTokensDfm))
+testTokensMat<-as.matrix(testTokensDfm)
+
+#normalize all documents via TF.
+testTokensTf <- apply(testTokensMat, 1, tf)
+
+#calculate the IDF vector that we will use - both
+#for training data and for test data!
+testTokensIdf <- apply(testTokensMat, 2, idf)
+
+#calculate TF-IDF for our training corpus.
+testTokensTfIdf <-  apply(testTokensTf, 2, tf_idf, idf = trainTokensIdf)
+
+#transposing the matrix
+testTokensTfIdf <- t(testTokensTfIdf)
+
+#imputing incomplete cases with "0"
+ic<- which(!complete.cases(testTokensTfIdf))
+testTokensTfIdf[ic,]<-0
+
+#to project new data in SVD semantic space
+testLsa<-t(sigmaInverse*uTranspose%*%t(testTokensTfIdf))
+```
+
+```{r}
+#creating new feature data frame using the document semantic space
+testSvd<-data.frame(hamOrspam=testSet$type,testLsa, textLength=nchar(testSet$text))
+```
+
+```{r}
+#to be on the positive side we are naming all the
+#columns of testSvd as the names of columns in trainSvd
+names(testSvd)<-names(trainSvd)
+```
+
+Now we will predict the type (ham or spam) for emails associated with our test
+data set using the model we have created with **Random Forest** machine learning model.
+```{r eval=TRUE}
+pred<-predict(mod,testSvd)
+confusionMatrix(pred,testSvd$hamOrspam)
+```
+
+Earlier we thought that it can be the case of overfitting because we were getting 100% accuracy with the train data set but now on applying the same model on test data set we getting more than **99% accuracy** and that too with good specificity and sensitivity. So we can consider this model as best fit model for now.
